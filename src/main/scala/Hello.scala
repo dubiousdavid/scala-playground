@@ -91,27 +91,104 @@ object Jdbc {
 }
 
 object QueryDSL {
-  case class Where(parent: Select, columnName: String, operator: String, columnValue: Any) {
-    def eq(value: Any) = parent.addWhereClause(this.copy(operator = "=", columnValue = value))
-    def gt(value: Any) = parent.addWhereClause(this.copy(operator = ">", columnValue = value))
-    def gte(value: Any) = parent.addWhereClause(this.copy(operator = ">=", columnValue = value))
-    def lt(value: Any) = parent.addWhereClause(this.copy(operator = "<", columnValue = value))
-    def lte(value: Any) = parent.addWhereClause(this.copy(operator = "<=", columnValue = value))
-
-    override def toString = s"$columnName $operator $columnValue"
-    def toStatement = (s"$columnName $operator ?", columnValue)
+  trait Statement {
+    def toStatement: (String, Vector[Any])
   }
 
   case class Column(columnName: String) {
-    def eq(value: Column) = println("Column")
-    def eq(value: Any) = println("Any")
-  }
-  // case class ColumnStatement()
+    private def withColumn(operator: String, column: Column) = ColumnStatement(
+      s"$columnName $operator ${column.columnName}", None, Vector()
+    )
+    private def withValue(operator: String, value: Any) = ColumnStatement(
+      s"$columnName $operator ?", Some(value), Vector()
+    )
 
-  case class Select(columnNames: Seq[String], tableName: String, where: Vector[Where]) {
-    def from(tableName: String) = this.copy(tableName = tableName)
-    def where(columnName: String) = Where(this, columnName, "=", "?")
-    def addWhereClause(whereClause: Where): Select = this.copy(where = where :+ whereClause)
+    def eq(column: Column): ColumnStatement = withColumn("=", column)
+    def eq(value: Any): ColumnStatement = withValue("=", value)
+
+    def gt(column: Column): ColumnStatement = withColumn(">", column)
+    def gt(value: Any): ColumnStatement = withValue(">", value)
+
+    def lt(column: Column): ColumnStatement = withColumn("<", column)
+    def lt(value: Any): ColumnStatement = withValue("<", value)
+
+    def asc: ColumnStatement = ColumnStatement(s"$columnName ASC", None, Vector())
+    def desc: ColumnStatement = ColumnStatement(s"$columnName DESC", None, Vector())
+
+    def like(value: String): ColumnStatement = withValue("LIKE", value)
+  }
+
+  case class ColumnStatement(
+    sql: String,
+    placeHolder: Option[Any],
+    subStatements: Vector[(String, ColumnStatement)]
+  ) extends Statement {
+
+    def toStatement = {
+      val combinedSql = sql + subStatements.foldLeft("") {
+        case (acc, (operator, statement)) => s"$acc $operator ${statement.sql}"
+      }
+
+      val subPlaceHolders = for {
+        (_, statement) <- subStatements
+        placeHolder <- statement.placeHolder
+      } yield placeHolder
+
+      (combinedSql, placeHolder.toVector ++ subPlaceHolders)
+    }
+
+    def and(subStatement: ColumnStatement): ColumnStatement = this.copy(
+      subStatements = subStatements :+ Tuple2("AND", subStatement)
+    )
+
+    def or(subStatement: ColumnStatement): ColumnStatement = this.copy(
+      subStatements = subStatements :+ Tuple2("OR", subStatement)
+    )
+  }
+
+  trait Join extends Statement
+
+  case class LeftJoin(tableName: String, on: ColumnStatement) extends Join {
+    def toStatement = {
+      val (onSql, onPlaceHolders) = on.toStatement
+      (s"LEFT JOIN $tableName ON $onSql", onPlaceHolders)
+    }
+  }
+
+  case class RightJoin(tableName: String, on: ColumnStatement) extends Join {
+    def toStatement = {
+      val (onSql, onPlaceHolders) = on.toStatement
+      (s"RIGHT JOIN $tableName ON $onSql", onPlaceHolders)
+    }
+  }
+
+  case class InnerJoin(tableName: String, on: ColumnStatement) extends Join {
+    def toStatement = {
+      val (onSql, onPlaceHolders) = on.toStatement
+      (s"INNER JOIN $tableName ON $onSql", onPlaceHolders)
+    }
+  }
+
+  case class IncompleteSelect(columnNames: Seq[String]) extends Statement {
+    def toStatement: Nothing = throw new Exception("Incomplete Select Statement")
+    def from(tableName: String): Select = Select(columnNames, tableName, Vector(), Vector())
+  }
+
+  case class Select(columnNames: Seq[String], tableName: String, where: Vector[ColumnStatement], joins: Vector[Join]) extends Statement {
+    def from(tableName: String): Select = this.copy(tableName = tableName)
+    def where(column: ColumnStatement): Select = this.copy(where = where :+ column)
+
+    def leftJoin(tableName: String, on: ColumnStatement): Select = {
+      this.copy(joins = joins :+ LeftJoin(tableName, on))
+    }
+
+    def rightJoin(tableName: String, on: ColumnStatement): Select = {
+      this.copy(joins = joins :+ RightJoin(tableName, on))
+    }
+
+    def innerJoin(tableName: String, on: ColumnStatement): Select = {
+      this.copy(joins = joins :+ InnerJoin(tableName, on))
+    }
 
     override def toString = {
       val whereClauses =
@@ -126,48 +203,44 @@ object QueryDSL {
     }
 
     def toStatement = {
-      val emptyTuple = (Vector.empty[String], Vector.empty[Any])
-      val (clauses, params) =
-        if (where.isEmpty) emptyTuple
+      val (whereClauses, wherePlaceHolders) =
+        if (where.isEmpty) ("", Vector())
         else {
-          where.map(_.toStatement)
-            .foldLeft(emptyTuple) {
-              case ((clauses, params), (clause, param)) => (clauses :+ clause, params :+ param)
-            }
+          val (clauses, placeHolders) = where.map(_.toStatement).unzip
+          val sql = "WHERE " + clauses.mkString(" AND ")
+          (sql, placeHolders)
         }
 
-      val whereClauses =
-        if (clauses.isEmpty) ""
-        else "WHERE " + clauses.mkString(" AND ")
+      val (joinClauses, joinPlaceHolders) = joins.map(_.toStatement).unzip
 
-      println("Params: [" + params.mkString(", ") + "]")
+      val placeHolders = joinPlaceHolders ++ wherePlaceHolders
 
-      s"""
+      println("Params: [" + placeHolders.mkString(", ") + "]")
+
+      val sql = s"""
       SELECT ${columnNames.mkString(", ")}
       FROM $tableName
+      $joinClauses
       $whereClauses
       """
+
+      (sql, placeHolders)
     }
   }
 
-  def select(columnNames: String*) = Select(columnNames, "?", Vector())
+  def select(columnNames: String*) = IncompleteSelect(columnNames)
   def col(columnName: String) = Column(columnName)
 
-  val query =
+  val query2 =
     select("*")
       .from("members")
-      .where("id").eq(2)
-
-  // val query2 =
-  //   select("*")
-  //     .from("members")
-  //     .leftJoin("someTable", col("id").eq(col("someTable.id")))
-  //     .where(
-  //       col("id").eq(2)
-  //         .and(
-  //           col("name").like("Bob%")
-  //         )
-  //     )
+      .leftJoin("someTable", col("id").eq(col("someTable.id")))
+      .where(
+        col("id").eq(2)
+          .and(
+            col("name").like("Bob%")
+          )
+      )
   //     .groupBy(col("name").asc
   //       .and(
   //         col("id").desc
